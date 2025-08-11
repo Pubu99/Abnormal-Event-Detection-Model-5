@@ -16,12 +16,13 @@ class CustomDataset(Dataset):
                 A.GaussianBlur(blur_limit=(3, 7), p=0.5),
                 A.HorizontalFlip(p=0.5),
                 A.Affine(rotate=(-15, 15), shear=(-10, 10), p=0.5),
-                A.RandomFog(fog_coef_intensity=0.2, p=0.3),  # Updated
+                A.RandomFog(fog_coef_range=(0.2, 0.2), p=0.3),  # fixed
                 A.RandomRain(p=0.3),
                 A.RandomShadow(p=0.3),
-                A.GaussNoise(var_limit=(10.0, 50.0), p=0.3),  # Updated
+                A.GaussNoise(std_range=(0.012, 0.028), p=0.3),
                 ToTensorV2()
             ])
+
         else:
             self.transform = ToTensorV2()
         

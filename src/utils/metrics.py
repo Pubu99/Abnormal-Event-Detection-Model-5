@@ -9,20 +9,21 @@ def evaluate_model(model, test_loader, device, classes):
     all_labels = []
     
     with torch.no_grad():
-        progress = tqdm(test_loader, desc="Evaluating")
+        progress = tqdm(test_loader, desc="Evaluating Test Set", leave=False)
         for seqs, labels in progress:
             seqs, labels = seqs.to(device), labels.to(device)
             outputs = model(seqs)
             preds = torch.argmax(outputs, dim=1).cpu().numpy()
             all_preds.extend(preds)
             all_labels.extend(labels.cpu().numpy())
+            progress.set_postfix(batch_accuracy=accuracy_score(labels.cpu().numpy(), preds))
     
     acc = accuracy_score(all_labels, all_preds)
     precision, recall, f1, _ = precision_recall_fscore_support(all_labels, all_preds, average=None, labels=range(len(classes)))
     macro_f1 = np.mean(f1)
     cm = confusion_matrix(all_labels, all_preds)
     
-    print(f"Overall Accuracy: {acc:.4f}")
+    print(f"\nOverall Accuracy: {acc:.4f}")
     for i, cls in enumerate(classes):
         print(f"{cls}: Precision={precision[i]:.4f}, Recall={recall[i]:.4f}, F1={f1[i]:.4f}")
     print(f"Macro F1: {macro_f1:.4f}")
@@ -35,10 +36,12 @@ def multi_class_accuracy(model, loader, device):
     correct = 0
     total = 0
     with torch.no_grad():
-        for seqs, labels in loader:
+        progress = tqdm(loader, desc="Computing Accuracy", leave=False)
+        for seqs, labels in progress:
             seqs, labels = seqs.to(device), labels.to(device)
             outputs = model(seqs)
             preds = torch.argmax(outputs, dim=1)
             correct += (preds == labels).sum().item()
             total += labels.size(0)
+            progress.set_postfix(batch_accuracy=correct/total)
     return correct / total
