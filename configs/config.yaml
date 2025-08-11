@@ -1,0 +1,8 @@
+data:
+  train_path: data/processed/train
+model:
+  num_classes: 14
+  lr: 0.001
+training:
+  epochs: 50
+  batch_size: 32
