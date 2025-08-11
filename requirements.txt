@@ -3,6 +3,7 @@ torchvision==0.22.0+cu128
 torchaudio==2.6.0+cu128
 opencv-python==4.10.0
 albumentations==1.4.14
+albucore==0.0.17
 wandb==0.17.5
 fastapi==0.112.0
 uvicorn==0.30.3

@@ -1,19 +1,25 @@
 import torch
 import torch.nn as nn
-from torchvision.models.video import efficientnet_b0_3d
+from torchvision.models.video import r3d_18
 from ultralytics import YOLO
 
 class AnomalyModel(nn.Module):
     def __init__(self, num_classes: int = 14, seq_len: int = 16):
         super().__init__()
         self.object_detector = YOLO('yolov8n.pt')
-        self.backbone = efficientnet_b0_3d(num_classes=0)
+        # Use ResNet-3D-18, pre-trained on Kinetics
+        self.backbone = r3d_18(pretrained=True)  # Changed from efficientnet_b0_3d
+        # Modify the final FC layer to output features (remove original classifier)
+        self.backbone.fc = nn.Identity()  # Remove default FC layer
+        # Get feature dimension (r3d_18 outputs 512 features)
+        self.feature_dim = 512
         self.dropout = nn.Dropout(0.2)
-        self.fc = nn.Linear(self.backbone.classifier.in_features, num_classes)
+        self.fc = nn.Linear(self.feature_dim, num_classes)
         self.softmax = nn.Softmax(dim=1)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        features = self.backbone(x)
+        # x: (B, C, T, H, W) - Batch, Channels, Time, Height, Width
+        features = self.backbone(x)  # (B, 512)
         features = self.dropout(features)
         out = self.fc(features)
         scores = self.softmax(out)
