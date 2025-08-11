@@ -6,6 +6,7 @@ from torch.cuda.amp import GradScaler, autocast
 import yaml
 from tqdm import tqdm
 import wandb
+from collections import Counter  # Added for class weights
 from src.data.dataset import CustomDataset
 from src.models.base_model import AnomalyModel
 from src.utils.metrics import multi_class_accuracy, evaluate_model
@@ -46,7 +47,18 @@ def train():
     model = AnomalyModel(config['model']['num_classes']).to(device)
     optimizer = optim.AdamW(model.parameters(), lr=config['model']['lr'])
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config['training']['epochs'])
-    criterion = nn.CrossEntropyLoss()
+    
+    # --- Class weights for imbalance ---
+    counts = Counter([label.item() for _, label in train_dataset])
+    num_classes = config['model']['num_classes']
+    weights = []
+    for i in range(num_classes):
+        weight = 1.0 / counts.get(i, 1e-6)  # Avoid division by zero
+        weights.append(weight)
+    weights = torch.tensor(weights).to(device)
+    weights = weights / weights.sum() * num_classes  # Normalize
+    criterion = nn.CrossEntropyLoss(weight=weights)
+    
     scaler = GradScaler()
     
     # --- Early stopping variables ---

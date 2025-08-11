@@ -2,6 +2,7 @@ import torch
 from torch.utils.data import Dataset
 import h5py
 import os
+import numpy as np
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 
@@ -15,10 +16,10 @@ class CustomDataset(Dataset):
                 A.GaussianBlur(blur_limit=(3, 7), p=0.5),
                 A.HorizontalFlip(p=0.5),
                 A.Affine(rotate=(-15, 15), shear=(-10, 10), p=0.5),
-                A.RandomFog(fog_coef_lower=0.1, fog_coef_upper=0.3, p=0.3),
+                A.RandomFog(fog_coef_intensity=0.2, p=0.3),  # Updated
                 A.RandomRain(p=0.3),
                 A.RandomShadow(p=0.3),
-                A.GaussNoise(var_limit=(10, 50), p=0.3),
+                A.GaussNoise(var_limit=(10.0, 50.0), p=0.3),  # Updated
                 ToTensorV2()
             ])
         else:
@@ -54,7 +55,6 @@ class CustomDataset(Dataset):
         for frame in seq:
             augmented = self.transform(image=frame)
             augmented_seq.append(augmented['image'])
-        
         # Shape: (seq_len, C, H, W) -> permute to (C, seq_len, H, W) if needed
         seq_tensor = torch.stack(augmented_seq).permute(1, 0, 2, 3)
         return seq_tensor.float() / 255.0, torch.tensor(label)

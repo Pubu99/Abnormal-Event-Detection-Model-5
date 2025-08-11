@@ -1,25 +1,21 @@
 import torch
 import torch.nn as nn
-from torchvision.models.video import r3d_18
+from torchvision.models.video import r3d_18, R3D_18_Weights  # Updated import
 from ultralytics import YOLO
 
 class AnomalyModel(nn.Module):
     def __init__(self, num_classes: int = 14, seq_len: int = 16):
         super().__init__()
         self.object_detector = YOLO('yolov8n.pt')
-        # Use ResNet-3D-18, pre-trained on Kinetics
-        self.backbone = r3d_18(pretrained=True)  # Changed from efficientnet_b0_3d
-        # Modify the final FC layer to output features (remove original classifier)
-        self.backbone.fc = nn.Identity()  # Remove default FC layer
-        # Get feature dimension (r3d_18 outputs 512 features)
+        self.backbone = r3d_18(weights=R3D_18_Weights.DEFAULT)  # Updated
+        self.backbone.fc = nn.Identity()
         self.feature_dim = 512
         self.dropout = nn.Dropout(0.2)
         self.fc = nn.Linear(self.feature_dim, num_classes)
         self.softmax = nn.Softmax(dim=1)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, C, T, H, W) - Batch, Channels, Time, Height, Width
-        features = self.backbone(x)  # (B, 512)
+        features = self.backbone(x)
         features = self.dropout(features)
         out = self.fc(features)
         scores = self.softmax(out)
@@ -28,7 +24,7 @@ class AnomalyModel(nn.Module):
     def detect_anomaly(self, scores: torch.Tensor, thresh: float = 0.5) -> str:
         pred = torch.argmax(scores, dim=1)
         conf = torch.max(scores, dim=1).values
-        if pred == 7:  # 'Normal Videos'
+        if pred == 7:
             return "No Anomaly"
         elif conf < thresh:
             return "Unknown Anomaly"
