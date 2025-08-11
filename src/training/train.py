@@ -15,11 +15,13 @@ def compute_val_loss(model, val_loader, criterion, device):
     model.eval()
     val_loss = 0
     with torch.no_grad():
-        for seqs, labels in val_loader:
+        progress = tqdm(val_loader, desc="Validation", leave=False)
+        for seqs, labels in progress:
             seqs, labels = seqs.to(device), labels.to(device)
             outputs = model(seqs)
             loss = criterion(outputs, labels)
             val_loss += loss.item()
+            progress.set_postfix(loss=loss.item())
     return val_loss / len(val_loader)
 
 def train():
@@ -123,6 +125,9 @@ def train():
         'Shooting', 'Shoplifting', 'Stealing', 'Vandalism'
     ]
     model.load_state_dict(torch.load('models_saved/best_model.pth'))
+
+    # Add tqdm progress for evaluation if evaluate_model internally loops over batches
+    # If not, you can wrap it similarly or modify that function.
     evaluate_model(model, test_loader, device, classes)
     
     return model, device
