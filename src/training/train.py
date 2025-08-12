@@ -2,11 +2,12 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, random_split
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 import yaml
 from tqdm import tqdm
 import wandb
 from collections import Counter
+import sys
 from src.data.dataset import CustomDataset
 from src.models.base_model import AnomalyModel
 from src.utils.metrics import multi_class_accuracy, evaluate_model
@@ -15,9 +16,10 @@ def compute_val_loss(model, val_loader, criterion, device):
     model.eval()
     val_loss = 0
     with torch.no_grad():
-        progress = tqdm(val_loader, desc="Validation", leave=True)  # Changed to leave=True
+        progress = tqdm(val_loader, desc="Validation", leave=True, file=sys.stdout)
         for batch_idx, (seqs, labels) in enumerate(progress):
             seqs, labels = seqs.to(device), labels.to(device)
+            print(f"Validation Batch {batch_idx+1}/{len(val_loader)}: Input Shape={seqs.shape}")
             outputs = model(seqs)
             loss = criterion(outputs, labels)
             val_loss += loss.item()
@@ -33,6 +35,8 @@ def train():
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
+    print(f"GPU Memory: {torch.cuda.memory_allocated(device)/1e9:.2f} GB allocated, "
+          f"{torch.cuda.memory_reserved(device)/1e9:.2f} GB reserved")
     
     # --- Dataset split into train/val ---
     print("Loading training dataset...")
@@ -45,9 +49,9 @@ def train():
     print(f"Train size: {train_size}, Validation size: {val_size}")
 
     train_loader = DataLoader(train_dataset, batch_size=config['training']['batch_size'],
-                              shuffle=True, num_workers=4, pin_memory=True)
+                              shuffle=True, num_workers=2, pin_memory=True)
     val_loader = DataLoader(val_dataset, batch_size=config['training']['batch_size'],
-                            shuffle=False, num_workers=4, pin_memory=True)
+                            shuffle=False, num_workers=2, pin_memory=True)
     
     # --- Model, optimizer, scheduler ---
     print("Initializing model...")
@@ -57,7 +61,9 @@ def train():
     
     # --- Class weights for imbalance ---
     print("Computing class weights...")
-    counts = Counter([label.item() for _, label in train_dataset])
+    counts = Counter()
+    for _, label in tqdm(train_dataset, desc="Counting Labels", leave=True, file=sys.stdout):
+        counts[label.item()] += 1
     num_classes = config['model']['num_classes']
     weights = []
     for i in range(num_classes):
@@ -68,7 +74,7 @@ def train():
     criterion = nn.CrossEntropyLoss(weight=weights)
     print(f"Class weights: {weights.tolist()}")
     
-    scaler = GradScaler()
+    scaler = GradScaler('cuda')
     
     # --- Early stopping variables ---
     best_acc = 0.0
@@ -78,11 +84,14 @@ def train():
     for epoch in range(config['training']['epochs']):
         model.train()
         epoch_loss = 0
-        progress = tqdm(train_loader, desc=f"Epoch {epoch+1}/{config['training']['epochs']}", leave=True)  # Changed to leave=True
+        progress = tqdm(train_loader, desc=f"Epoch {epoch+1}/{config['training']['epochs']}", 
+                        leave=True, file=sys.stdout)
         for batch_idx, (seqs, labels) in enumerate(progress):
             seqs, labels = seqs.to(device), labels.to(device)
+            print(f"Epoch {epoch+1}, Batch {batch_idx+1}/{len(train_loader)}: "
+                  f"Input Shape={seqs.shape}, GPU Memory={torch.cuda.memory_allocated(device)/1e9:.2f} GB")
             optimizer.zero_grad()
-            with autocast():
+            with autocast('cuda'):
                 outputs = model(seqs)
                 loss = criterion(outputs, labels)
             scaler.scale(loss).backward()
@@ -90,7 +99,7 @@ def train():
             scaler.update()
             epoch_loss += loss.item()
             progress.set_postfix(loss=loss.item())
-            if batch_idx % 10 == 0:  # Print every 10 batches
+            if batch_idx % 10 == 0:
                 print(f"Epoch {epoch+1}, Batch {batch_idx+1}/{len(train_loader)}: Loss={loss.item():.4f}")
         
         avg_loss = epoch_loss / len(train_loader)
@@ -131,7 +140,7 @@ def train():
     print("Loading test dataset...")
     test_dataset = CustomDataset(config['data']['test_path'], train=False)
     print(f"Test dataset size: {len(test_dataset)} samples")
-    test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, num_workers=4, pin_memory=True)
+    test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, num_workers=2, pin_memory=True)
     classes = [
         'Abuse', 'Arrest', 'Arson', 'Assault', 'Burglary', 'Explosion',
         'Fighting', 'Normal Videos', 'RoadAccidents', 'Robbery',
@@ -146,5 +155,5 @@ def train():
 
 if __name__ == '__main__':
     import os
-    os.environ["PYTHONUNBUFFERED"] = "1"  # Force unbuffered output
+    os.environ["PYTHONUNBUFFERED"] = "1"
     train()
