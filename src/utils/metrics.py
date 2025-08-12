@@ -13,26 +13,34 @@ def evaluate_model(model, test_loader, device, classes):
         progress = tqdm(test_loader, desc="Evaluating Test Set", leave=True, file=sys.stdout)
         for batch_idx, (seqs, labels) in enumerate(progress):
             seqs, labels = seqs.to(device), labels.to(device)
-            print(f"Test Batch {batch_idx+1}/{len(test_loader)}: Input Shape={seqs.shape}")
             outputs = model(seqs)
             preds = torch.argmax(outputs, dim=1).cpu().numpy()
             all_preds.extend(preds)
             all_labels.extend(labels.cpu().numpy())
             progress.set_postfix(batch_accuracy=accuracy_score(labels.cpu().numpy(), preds))
-            print(f"Test Batch {batch_idx+1}/{len(test_loader)}: Batch Accuracy={accuracy_score(labels.cpu().numpy(), preds):.4f}")
     
+    # Compute metrics
     acc = accuracy_score(all_labels, all_preds)
-    precision, recall, f1, _ = precision_recall_fscore_support(all_labels, all_preds, average=None, labels=range(len(classes)))
+    precision, recall, f1, support = precision_recall_fscore_support(all_labels, all_preds, 
+                                                                    average=None, labels=range(len(classes)))
     macro_f1 = np.mean(f1)
+    weighted_f1 = np.sum(f1 * support) / np.sum(support)
     cm = confusion_matrix(all_labels, all_preds)
     
-    print(f"\nOverall Accuracy: {acc:.4f}")
+    # Print detailed evaluation
+    print("\nTest Set Evaluation:")
+    print(f"Overall Accuracy: {acc:.4f}")
+    print("\nPer-Class Metrics:")
+    print(f"{'Class':<20} {'Precision':<10} {'Recall':<10} {'F1-Score':<10} {'Support':<10}")
+    print("-" * 60)
     for i, cls in enumerate(classes):
-        print(f"{cls}: Precision={precision[i]:.4f}, Recall={recall[i]:.4f}, F1={f1[i]:.4f}")
-    print(f"Macro F1: {macro_f1:.4f}")
-    print("Confusion Matrix:\n", cm)
+        print(f"{cls:<20} {precision[i]:<10.4f} {recall[i]:<10.4f} {f1[i]:<10.4f} {support[i]:<10}")
+    print(f"\nMacro Average F1: {macro_f1:.4f}")
+    print(f"Weighted Average F1: {weighted_f1:.4f}")
+    print("\nConfusion Matrix:")
+    print(cm)
     
-    return acc, macro_f1
+    return acc, macro_f1, weighted_f1
 
 def multi_class_accuracy(model, loader, device):
     model.eval()
@@ -42,11 +50,9 @@ def multi_class_accuracy(model, loader, device):
         progress = tqdm(loader, desc="Computing Accuracy", leave=True, file=sys.stdout)
         for batch_idx, (seqs, labels) in enumerate(progress):
             seqs, labels = seqs.to(device), labels.to(device)
-            print(f"Accuracy Batch {batch_idx+1}/{len(loader)}: Input Shape={seqs.shape}")
             outputs = model(seqs)
             preds = torch.argmax(outputs, dim=1)
             correct += (preds == labels).sum().item()
             total += labels.size(0)
             progress.set_postfix(batch_accuracy=correct/total)
-            print(f"Accuracy Batch {batch_idx+1}/{len(loader)}: Batch Accuracy={correct/total:.4f}")
     return correct / total

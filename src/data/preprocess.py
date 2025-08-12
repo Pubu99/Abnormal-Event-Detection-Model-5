@@ -3,6 +3,8 @@ import cv2
 import h5py
 import numpy as np
 from tqdm import tqdm
+import yaml
+from collections import Counter
 
 def preprocess_data(raw_dir: str, processed_dir: str, seq_len: int = 16, img_size: tuple = (64, 64)):
     # List class folders, ignore non-directories or hidden files
@@ -11,7 +13,10 @@ def preprocess_data(raw_dir: str, processed_dir: str, seq_len: int = 16, img_siz
     
     os.makedirs(processed_dir, exist_ok=True)
     
-    for cls in tqdm(classes, desc="Processing classes"):
+    # Initialize counter for label counts
+    label_counts = Counter()
+    
+    for cls in tqdm(classes, desc="Processing classes", file=sys.stdout):
         cls_path = os.path.join(raw_dir, cls)
         images = sorted([f for f in os.listdir(cls_path) if f.endswith('.png')])
         print(f"Class '{cls}' - {len(images)} images found")
@@ -24,7 +29,8 @@ def preprocess_data(raw_dir: str, processed_dir: str, seq_len: int = 16, img_siz
             print(f"Warning: Not enough images in class '{cls}' to form one sequence of length {seq_len}. Skipping.")
             continue
         
-        for i in tqdm(range(0, len(images) - seq_len + 1, seq_len), desc=f"Building sequences for {cls}", leave=False):
+        for i in tqdm(range(0, len(images) - seq_len + 1, seq_len), 
+                      desc=f"Building sequences for {cls}", leave=False, file=sys.stdout):
             seq = []
             for j in range(seq_len):
                 img_path = os.path.join(cls_path, images[i + j])
@@ -35,6 +41,7 @@ def preprocess_data(raw_dir: str, processed_dir: str, seq_len: int = 16, img_siz
                 seq.append(img)
             seqs.append(np.array(seq))
             labels.append(class_idx)
+            label_counts[class_idx] += 1
         
         if seqs:
             out_path = os.path.join(processed_dir, f'{cls}_sequences.h5')
@@ -44,6 +51,12 @@ def preprocess_data(raw_dir: str, processed_dir: str, seq_len: int = 16, img_siz
             print(f"Saved {len(seqs)} sequences for class '{cls}' to {out_path}")
         else:
             print(f"No sequences created for class '{cls}'")
+    
+    # Save label counts to YAML
+    label_counts_path = os.path.join(processed_dir, 'label_counts.yaml')
+    with open(label_counts_path, 'w') as f:
+        yaml.dump(dict(label_counts), f)
+    print(f"Saved label counts to {label_counts_path}")
 
 if __name__ == "__main__":
     import sys
