@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, random_split, WeightedRandomSampler
 from torch.amp import GradScaler, autocast
 import yaml
 from tqdm import tqdm
@@ -9,18 +9,37 @@ import wandb
 from collections import Counter
 import sys
 import os
+import numpy as np
+import time
+from sklearn.metrics import precision_recall_fscore_support, confusion_matrix
+import matplotlib.pyplot as plt
 from src.data.dataset import CustomDataset
 from src.models.base_model import AnomalyModel
 from src.utils.metrics import multi_class_accuracy, evaluate_model
+
+class FocalLoss(nn.Module):
+    def __init__(self, alpha, gamma=2, reduction='mean'):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+    
+    def forward(self, inputs, targets):
+        ce_loss = nn.CrossEntropyLoss(reduction='none')(inputs, targets)
+        pt = torch.exp(-ce_loss)
+        focal_loss = self.alpha[targets] * (1 - pt) ** self.gamma * ce_loss
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        return focal_loss
 
 def compute_val_loss(model, val_loader, criterion, device):
     model.eval()
     val_loss = 0
     with torch.no_grad():
         progress = tqdm(val_loader, desc="Validation", leave=True, file=sys.stdout)
-        for batch_idx, (seqs, labels) in enumerate(progress):
-            seqs, labels = seqs.to(device), labels.to(device)
-            outputs = model(seqs)
+        for batch_idx, (seqs, labels, yolo_features) in enumerate(progress):
+            seqs, labels, yolo_features = seqs.to(device), labels.to(device), yolo_features.to(device)
+            outputs = model(seqs, yolo_features)
             loss = criterion(outputs, labels)
             val_loss += loss.item()
             progress.set_postfix(loss=loss.item())
@@ -33,13 +52,10 @@ def train():
     wandb.init(project="anomaly-detection", config=config)
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
-    print(f"GPU Memory: {torch.cuda.memory_allocated(device)/1e9:.2f} GB allocated, "
-          f"{torch.cuda.memory_reserved(device)/1e9:.2f} GB reserved")
     
     # --- Dataset split into train/val ---
     print("Loading training dataset...")
-    full_dataset = CustomDataset(config['data']['train_path'], train=True)
+    full_dataset = CustomDataset(config['data']['train_path'], config['data']['train_yolo_path'], train=True)
     print(f"Dataset size: {len(full_dataset)} samples")
     val_ratio = config['training'].get('val_ratio', 0.1)
     val_size = int(len(full_dataset) * val_ratio)
@@ -47,33 +63,37 @@ def train():
     train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size])
     print(f"Train size: {train_size}, Validation size: {val_size}")
 
+    # --- Oversampling with WeightedRandomSampler ---
+    label_counts_path = os.path.join(config['data']['train_path'], 'label_counts.yaml')
+    with open(label_counts_path, 'r') as f:
+        counts = yaml.safe_load(f)
+    train_labels = [train_dataset[i][1].item() for i in range(len(train_dataset))]
+    class_weights = [1.0 / counts.get(label, 1) for label in train_labels]
+    sampler = WeightedRandomSampler(weights=class_weights, num_samples=len(train_labels), replacement=True)
+    
     train_loader = DataLoader(train_dataset, batch_size=config['training']['batch_size'],
-                              shuffle=True, num_workers=2, pin_memory=True)
+                              sampler=sampler, num_workers=4, pin_memory=True)
     val_loader = DataLoader(val_dataset, batch_size=config['training']['batch_size'],
-                            shuffle=False, num_workers=2, pin_memory=True)
+                            shuffle=False, num_workers=4, pin_memory=True)
     
     # --- Model, optimizer, scheduler ---
     print("Initializing model...")
     model = AnomalyModel(config['model']['num_classes']).to(device)
-    optimizer = optim.AdamW(model.parameters(), lr=config['model']['lr'])
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config['training']['epochs'])
+    print(f"GPU Memory after model init: {torch.cuda.memory_allocated(device)/1e9:.2f} GB allocated, "
+          f"{torch.cuda.memory_reserved(device)/1e9:.2f} GB reserved")
     
-    # --- Class weights for imbalance ---
-    print("Loading class weights...")
-    label_counts_path = os.path.join(config['data']['train_path'], 'label_counts.yaml')
-    if not os.path.exists(label_counts_path):
-        raise FileNotFoundError(f"Label counts file not found at {label_counts_path}. Run preprocess.py first.")
-    with open(label_counts_path, 'r') as f:
-        counts = Counter(yaml.safe_load(f))
+    # --- Per-class alpha for Focal Loss ---
     num_classes = config['model']['num_classes']
-    weights = []
-    for i in range(num_classes):
-        weight = 1.0 / counts.get(i, 1e-6)
-        weights.append(weight)
-    weights = torch.tensor(weights).to(device)
-    weights = weights / weights.sum() * num_classes
-    criterion = nn.CrossEntropyLoss(weight=weights)
-    print(f"Class weights: {weights.tolist()}")
+    alpha = [1.0 / counts.get(i, 1) for i in range(num_classes)]
+    alpha = torch.tensor(alpha).to(device)
+    alpha = alpha / alpha.sum() * num_classes
+    
+    optimizer = optim.AdamW(model.parameters(), lr=config['model']['lr'], weight_decay=0.01)
+    scheduler = optim.lr_scheduler.OneCycleLR(
+        optimizer, max_lr=config['model']['lr'], 
+        steps_per_epoch=len(train_loader), epochs=config['training']['epochs']
+    )
+    criterion = FocalLoss(alpha=alpha, gamma=2)
     
     scaler = GradScaler('cuda')
     
@@ -82,7 +102,7 @@ def train():
     os.makedirs(checkpoint_dir, exist_ok=True)
     checkpoint_path = os.path.join(checkpoint_dir, 'checkpoint_latest.pth')
     start_epoch = 0
-    best_acc = 0.0
+    best_macro_f1 = 0.0
     if os.path.exists(checkpoint_path):
         checkpoint = torch.load(checkpoint_path, map_location=device)
         model.load_state_dict(checkpoint['model_state_dict'])
@@ -90,8 +110,8 @@ def train():
         scaler.load_state_dict(checkpoint['scaler_state_dict'])
         scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         start_epoch = checkpoint['epoch'] + 1
-        best_acc = checkpoint['best_acc']
-        print(f"Resumed from checkpoint at epoch {start_epoch} with best val_acc={best_acc:.4f}")
+        best_macro_f1 = checkpoint['best_macro_f1']
+        print(f"Resumed from checkpoint at epoch {start_epoch} with best macro F1={best_macro_f1:.4f}")
     
     # --- Early stopping variables ---
     patience = config['training'].get('patience', 5)
@@ -100,19 +120,22 @@ def train():
     for epoch in range(start_epoch, config['training']['epochs']):
         model.train()
         epoch_loss = 0
+        yolo_time = 0
         progress = tqdm(train_loader, desc=f"Epoch {epoch+1}/{config['training']['epochs']}", 
                         leave=True, file=sys.stdout)
-        for batch_idx, (seqs, labels) in enumerate(progress):
-            seqs, labels = seqs.to(device), labels.to(device)
+        for batch_idx, (seqs, labels, yolo_features) in enumerate(progress):
+            seqs, labels, yolo_features = seqs.to(device), labels.to(device), yolo_features.to(device)
             optimizer.zero_grad()
+            start_time = time.time()
             with autocast('cuda'):
-                outputs = model(seqs)
+                outputs = model(seqs, yolo_features)
                 loss = criterion(outputs, labels)
+            yolo_time += time.time() - start_time
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
             epoch_loss += loss.item()
-            progress.set_postfix(loss=loss.item())
+            progress.set_postfix(loss=loss.item(), scaler=scaler.get_scale())
         
         avg_loss = epoch_loss / len(train_loader)
         train_acc = multi_class_accuracy(model, train_loader, device)
@@ -121,6 +144,17 @@ def train():
         val_loss = compute_val_loss(model, val_loader, criterion, device)
         val_acc = multi_class_accuracy(model, val_loader, device)
         
+        # --- Compute val macro F1 ---
+        val_preds, val_labels = [], []
+        with torch.no_grad():
+            for seqs, labels, yolo_features in val_loader:
+                seqs, labels, yolo_features = seqs.to(device), labels.to(device), yolo_features.to(device)
+                outputs = model(seqs, yolo_features)
+                preds = torch.argmax(outputs, dim=1).cpu().numpy()
+                val_preds.extend(preds)
+                val_labels.extend(labels.cpu().numpy())
+        val_macro_f1 = precision_recall_fscore_support(val_labels, val_preds, average='macro')[2]
+        
         # --- Logging ---
         wandb.log({
             'epoch': epoch,
@@ -128,16 +162,22 @@ def train():
             'train_acc': train_acc,
             'val_loss': val_loss,
             'val_acc': val_acc,
-            'lr': scheduler.get_last_lr()[0]
+            'val_macro_f1': val_macro_f1,
+            'lr': scheduler.get_last_lr()[0],
+            'scaler': scaler.get_scale(),
+            'yolo_time': yolo_time
         })
         
         # --- Epoch summary ---
         print(f"\nEpoch {epoch+1} Summary:")
         print(f"  Train Loss: {avg_loss:.4f}, Train Accuracy: {train_acc:.4f}")
         print(f"  Validation Loss: {val_loss:.4f}, Validation Accuracy: {val_acc:.4f}")
+        print(f"  Validation Macro F1: {val_macro_f1:.4f}")
         print(f"  Learning Rate: {scheduler.get_last_lr()[0]:.6f}")
         print(f"  GPU Memory: {torch.cuda.memory_allocated(device)/1e9:.2f} GB allocated, "
               f"{torch.cuda.memory_reserved(device)/1e9:.2f} GB reserved")
+        print(f"  Scaler: {scaler.get_scale():.2f}")
+        print(f"  YOLO Time: {yolo_time:.2f}s")
         
         # --- Save checkpoint ---
         if epoch % 5 == 0 or epoch == config['training']['epochs'] - 1:
@@ -147,15 +187,15 @@ def train():
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scaler_state_dict': scaler.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),
-                'best_acc': best_acc
+                'best_macro_f1': best_macro_f1
             }, checkpoint_path)
             print(f"Checkpoint saved at epoch {epoch+1} to {checkpoint_path}")
         
         # --- Early stopping check ---
-        if val_acc > best_acc:
-            best_acc = val_acc
+        if val_macro_f1 > best_macro_f1:
+            best_macro_f1 = val_macro_f1
             torch.save(model.state_dict(), os.path.join(checkpoint_dir, 'best_model.pth'))
-            print(f"New best model saved at epoch {epoch+1} with val_acc={val_acc:.4f}")
+            print(f"New best model saved at epoch {epoch+1} with val_macro_f1={val_macro_f1:.4f}")
             counter = 0
         else:
             counter += 1
@@ -165,11 +205,11 @@ def train():
         
         scheduler.step()
     
-    # --- Evaluation on test set ---
+    # --- Evaluation on best model ---
     print("Loading test dataset...")
-    test_dataset = CustomDataset(config['data']['test_path'], train=False)
+    test_dataset = CustomDataset(config['data']['test_path'], config['data']['test_yolo_path'], train=False)
     print(f"Test dataset size: {len(test_dataset)} samples")
-    test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, num_workers=2, pin_memory=True)
+    test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, num_workers=4, pin_memory=True)
     classes = [
         'Abuse', 'Arrest', 'Arson', 'Assault', 'Burglary', 'Explosion',
         'Fighting', 'Normal Videos', 'RoadAccidents', 'Robbery',
@@ -180,7 +220,57 @@ def train():
     acc, macro_f1, weighted_f1 = evaluate_model(model, test_loader, device, classes)
     print(f"Test Evaluation Complete: Accuracy={acc:.4f}, Macro F1={macro_f1:.4f}, Weighted F1={weighted_f1:.4f}")
     
+    # --- Save evaluation to TXT and images ---
+    eval_dir = os.path.join(checkpoint_dir, 'evaluation')
+    os.makedirs(eval_dir, exist_ok=True)
+    txt_path = os.path.join(eval_dir, 'test_metrics.txt')
+    with open(txt_path, 'w') as f:
+        f.write(f"Test Evaluation Complete: Accuracy={acc:.4f}, Macro F1={macro_f1:.4f}, Weighted F1={weighted_f1:.4f}\n")
+        f.write("\nPer-Class Metrics:\n")
+        f.write(f"{'Class':<20} {'Precision':<10} {'Recall':<10} {'F1-Score':<10} {'Support':<10}\n")
+        f.write("-" * 60 + "\n")
+        all_preds, all_labels = [], []
+        with torch.no_grad():
+            for seqs, labels, yolo_features in test_loader:
+                seqs, labels, yolo_features = seqs.to(device), labels.to(device), yolo_features.to(device)
+                outputs = model(seqs, yolo_features)
+                preds = torch.argmax(outputs, dim=1).cpu().numpy()
+                all_preds.extend(preds)
+                all_labels.extend(labels.cpu().numpy())
+        precision, recall, f1, support = precision_recall_fscore_support(all_labels, all_preds, average=None, labels=range(len(classes)))
+        for i, cls in enumerate(classes):
+            f.write(f"{cls:<20} {precision[i]:<10.4f} {recall[i]:<10.4f} {f1[i]:<10.4f} {support[i]:<10}\n")
+        f.write(f"\nMacro Average F1: {macro_f1:.4f}\n")
+        f.write(f"Weighted Average F1: {weighted_f1:.4f}\n")
+        f.write("\nConfusion Matrix:\n")
+        cm = confusion_matrix(all_labels, all_preds)
+        f.write(str(cm) + "\n")
+    print(f"Test metrics saved to {txt_path}")
+    
+    from sklearn.metrics import ConfusionMatrixDisplay
+    disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=classes)
+    disp.plot(cmap=plt.cm.Blues, xticks_rotation='vertical')
+    cm_path = os.path.join(eval_dir, 'confusion_matrix.png')
+    plt.savefig(cm_path, bbox_inches='tight')
+    plt.close()
+    print(f"Confusion matrix saved to {cm_path}")
+    
     return model, device
+
+def multi_class_accuracy(model, loader, device):
+    model.eval()
+    correct = 0
+    total = 0
+    with torch.no_grad():
+        progress = tqdm(loader, desc="Computing Accuracy", leave=True, file=sys.stdout)
+        for batch_idx, (seqs, labels, yolo_features) in enumerate(progress):
+            seqs, labels, yolo_features = seqs.to(device), labels.to(device), yolo_features.to(device)
+            outputs = model(seqs, yolo_features)
+            preds = torch.argmax(outputs, dim=1)
+            correct += (preds == labels).sum().item()
+            total += labels.size(0)
+            progress.set_postfix(batch_accuracy=correct/total)
+    return correct / total
 
 if __name__ == "__main__":
     import os

@@ -1,34 +1,32 @@
 import torch
 import torch.nn as nn
-from torchvision.models.video import r3d_18, R3D_18_Weights
-from ultralytics import YOLO
+from transformers import TimeSformerForVideoClassification
 
 class AnomalyModel(nn.Module):
     def __init__(self, num_classes: int = 14, seq_len: int = 16):
         super().__init__()
-        self.backbone = r3d_18(weights=R3D_18_Weights.DEFAULT)
-        self.backbone.fc = nn.Identity()
-        self.feature_dim = 512
-        self.dropout = nn.Dropout(0.2)
-        self.fc = nn.Linear(self.feature_dim, num_classes)
-        self.softmax = nn.Softmax(dim=1)
-        # Initialize YOLO lazily to avoid method conflicts
-        self._yolo = None
+        self.backbone = TimeSformerForVideoClassification.from_pretrained(
+            "facebook/timesformer-base-finetuned-k400",
+            num_labels=num_classes,
+            ignore_mismatched_sizes=True
+        )
+        self.backbone.gradient_checkpointing_enable()
+        self.yolo_fc = nn.Linear(80, num_classes)
+        self.gate = nn.Sequential(
+            nn.Linear(num_classes * 2, num_classes),
+            nn.Sigmoid()
+        )
+        self.fusion = nn.Linear(num_classes, num_classes)
     
-    @property
-    def object_detector(self):
-        if self._yolo is None:
-            self._yolo = YOLO('yolov8n.pt')
-        return self._yolo
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        features = self.backbone(x)
-        features = self.dropout(features)
-        out = self.fc(features)
-        scores = self.softmax(out)
-        return scores
+    def forward(self, x: torch.Tensor, yolo_features: torch.Tensor) -> torch.Tensor:
+        ts_logits = self.backbone(x).logits
+        yolo_logits = self.yolo_fc(yolo_features.mean(dim=1))  # Average over frames
+        gate = self.gate(torch.cat([ts_logits, yolo_logits], dim=1))
+        fused_logits = self.fusion(gate * ts_logits + (1 - gate) * yolo_logits)
+        return fused_logits
     
     def detect_anomaly(self, scores: torch.Tensor, thresh: float = 0.5) -> str:
+        scores = torch.softmax(scores, dim=1)
         pred = torch.argmax(scores, dim=1)
         conf = torch.max(scores, dim=1).values
         if pred == 7:

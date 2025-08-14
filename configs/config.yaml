@@ -1,11 +1,13 @@
 data:
   train_path: data/processed/train
-  test_path: data/processed/test # Added for test dataset
+  test_path: data/processed/test
+  train_yolo_path: data/processed/train_yolo # Added
+  test_yolo_path: data/processed/test_yolo # Added
 model:
   num_classes: 14
-  lr: 0.001
+  lr: 0.0005
 training:
-  epochs: 50
+  epochs: 100
   batch_size: 32
-  val_ratio: 0.1 # Added for validation split
-  patience: 5 # Added for early stopping
+  val_ratio: 0.1
+  patience: 5

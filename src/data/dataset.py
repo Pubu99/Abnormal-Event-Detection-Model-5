@@ -7,25 +7,32 @@ import albumentations as A
 from albumentations.pytorch import ToTensorV2
 
 class CustomDataset(Dataset):
-    def __init__(self, processed_dir: str, train: bool = True):
+    def __init__(self, processed_dir: str, yolo_dir: str = None, train: bool = True):
         self.files = [os.path.join(processed_dir, f) for f in os.listdir(processed_dir) if f.endswith('.h5')]
+        self.yolo_files = [os.path.join(yolo_dir, f) for f in os.listdir(yolo_dir) if f.endswith('.h5')] if yolo_dir else None
         self.train = train
         if train:
-            self.transform = A.Compose([
-                A.RandomBrightnessContrast(brightness_limit=0.3, contrast_limit=0.3, p=0.7),
-                A.GaussianBlur(blur_limit=(3, 7), p=0.5),
+            self.strong_transform = A.Compose([
+                A.RandomBrightnessContrast(brightness_limit=0.5, contrast_limit=0.5, p=0.8),
+                A.GaussianBlur(blur_limit=(3, 9), p=0.6),
                 A.HorizontalFlip(p=0.5),
-                A.Affine(rotate=(-15, 15), shear=(-10, 10), p=0.5),
-                A.RandomFog(fog_coef_intensity=0.2, p=0.3),  # Fixed
-                A.RandomRain(p=0.3),
-                A.RandomShadow(p=0.3),
-                A.GaussNoise(var_limit=(10.0, 50.0), p=0.3),  # Fixed
+                A.Affine(rotate=(-30, 30), shear=(-20, 20), p=0.7),
+                A.RandomFog(fog_coef_intensity=0.3, p=0.4),
+                A.RandomRain(p=0.4, blur_value=5),
+                A.RandomShadow(p=0.4),
+                A.GaussNoise(var_limit=(20.0, 60.0), p=0.4),
+                A.MotionBlur(blur_limit=7, p=0.3),
+                A.OpticalDistortion(p=0.3),
+                ToTensorV2()
+            ])
+            self.light_transform = A.Compose([
+                A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.5),
+                A.HorizontalFlip(p=0.5),
                 ToTensorV2()
             ])
         else:
             self.transform = ToTensorV2()
         
-        # Precompute lengths for __len__ optimization
         self.lengths = []
         for f in self.files:
             with h5py.File(f, 'r') as hf:
@@ -50,10 +57,38 @@ class CustomDataset(Dataset):
             seq = hf['sequences'][offset]
             label = hf['labels'][offset]
         
+        # Temporal augmentation
+        if self.train and np.random.rand() < 0.5:
+            seq_len = len(seq)
+            drop_num = np.random.randint(0, seq_len // 4)  # Drop up to 25% frames
+            keep_indices = np.random.choice(seq_len, seq_len - drop_num, replace=False)
+            keep_indices.sort()
+            seq = seq[keep_indices]
+            if len(seq) < seq_len:  # Pad with last frame
+                seq = np.pad(seq, ((0, seq_len - len(seq)), (0, 0), (0, 0), (0, 0)), mode='edge')
+            # Speed perturbation: subsample or stretch
+            if np.random.rand() < 0.3:
+                speed = np.random.uniform(0.8, 1.2)
+                new_len = int(seq_len / speed)
+                indices = np.linspace(0, seq_len - 1, new_len).astype(int)
+                seq = seq[np.clip(indices, 0, seq_len - 1)]
+                if len(seq) < seq_len:
+                    seq = np.pad(seq, ((0, seq_len - len(seq)), (0, 0), (0, 0), (0, 0)), mode='edge')
+                elif len(seq) > seq_len:
+                    seq = seq[:seq_len]
+        
         augmented_seq = []
+        transform = self.strong_transform if self.train and np.random.rand() < 0.6 else self.light_transform
         for frame in seq:
-            augmented = self.transform(image=frame)
+            augmented = transform(image=frame) if self.train else self.transform(image=frame)
             augmented_seq.append(augmented['image'])
         
         seq_tensor = torch.stack(augmented_seq).permute(1, 0, 2, 3)
-        return seq_tensor.float() / 255.0, torch.tensor(label, dtype=torch.long)  # Fixed
+        
+        # Load YOLO features
+        yolo_features = torch.zeros(16, 80) if self.yolo_files is None else None
+        if self.yolo_files:
+            with h5py.File(self.yolo_files[file_idx], 'r') as hf_yolo:
+                yolo_features = torch.tensor(hf_yolo['yolo_features'][offset], dtype=torch.float32)
+        
+        return seq_tensor.float() / 255.0, torch.tensor(label, dtype=torch.long), yolo_features
