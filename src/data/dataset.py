@@ -17,14 +17,16 @@ class CustomDataset(Dataset):
                 A.GaussianBlur(blur_limit=(3, 9), p=0.6),
                 A.HorizontalFlip(p=0.5),
                 A.Affine(rotate=(-30, 30), shear=(-20, 20), p=0.7),
-                A.RandomFog(fog_coef_intensity=0.3, p=0.4),
+                A.RandomFog(fog_coef_range=(0.1, 0.3), p=0.4),
                 A.RandomRain(p=0.4, blur_value=5),
                 A.RandomShadow(p=0.4),
-                A.GaussNoise(var_limit=(20.0, 60.0), p=0.4),
+                A.GaussNoise(p=0.4),  # fixed here
                 A.MotionBlur(blur_limit=7, p=0.3),
                 A.OpticalDistortion(p=0.3),
                 ToTensorV2()
             ])
+
+
             self.light_transform = A.Compose([
                 A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.5),
                 A.HorizontalFlip(p=0.5),
