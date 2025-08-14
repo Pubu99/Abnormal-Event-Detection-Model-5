@@ -64,12 +64,24 @@ def train():
     print(f"Train size: {train_size}, Validation size: {val_size}")
 
     # --- Oversampling with WeightedRandomSampler ---
+    print("Computing class weights for oversampling...")
     label_counts_path = os.path.join(config['data']['train_path'], 'label_counts.yaml')
     with open(label_counts_path, 'r') as f:
         counts = yaml.safe_load(f)
-    train_labels = [train_dataset[i][1].item() for i in range(len(train_dataset))]
+    print("Class counts from label_counts.yaml:", counts)
+    
+    train_labels = []
+    for i in tqdm(range(len(train_dataset)), desc="Collecting train labels", leave=True, file=sys.stdout):
+        train_labels.append(train_dataset[i][1].item())
+    
+    label_dist = Counter(train_labels)
+    print("Training label distribution:", {i: label_dist.get(i, 0) for i in range(config['model']['num_classes'])})
+    
     class_weights = [1.0 / counts.get(label, 1) for label in train_labels]
+    print(f"Class weights (first 5 samples): {class_weights[:5]}")
+    
     sampler = WeightedRandomSampler(weights=class_weights, num_samples=len(train_labels), replacement=True)
+    print("WeightedRandomSampler initialized.")
     
     train_loader = DataLoader(train_dataset, batch_size=config['training']['batch_size'],
                               sampler=sampler, num_workers=4, pin_memory=True)
@@ -87,6 +99,7 @@ def train():
     alpha = [1.0 / counts.get(i, 1) for i in range(num_classes)]
     alpha = torch.tensor(alpha).to(device)
     alpha = alpha / alpha.sum() * num_classes
+    print(f"Focal Loss alpha: {alpha.cpu().numpy().tolist()}")
     
     optimizer = optim.AdamW(model.parameters(), lr=config['model']['lr'], weight_decay=0.01)
     scheduler = optim.lr_scheduler.OneCycleLR(
