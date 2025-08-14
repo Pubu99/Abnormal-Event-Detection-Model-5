@@ -13,12 +13,13 @@ import numpy as np
 import time
 from sklearn.metrics import precision_recall_fscore_support, confusion_matrix
 import matplotlib.pyplot as plt
+import pandas as pd
 from src.data.dataset import CustomDataset
 from src.models.base_model import AnomalyModel
 from src.utils.metrics import multi_class_accuracy, evaluate_model
 
 class FocalLoss(nn.Module):
-    def __init__(self, alpha, gamma=2, reduction='mean'):
+    def __init__(self, alpha, gamma=3, reduction='mean'):  # Increased gamma to 3
         super().__init__()
         self.alpha = alpha
         self.gamma = gamma
@@ -39,13 +40,16 @@ def compute_val_loss(model, val_loader, criterion, device):
         progress = tqdm(val_loader, desc="Validation", leave=True, file=sys.stdout)
         for batch_idx, (seqs, labels, yolo_features) in enumerate(progress):
             seqs, labels, yolo_features = seqs.to(device), labels.to(device), yolo_features.to(device)
-            outputs = model(seqs, yolo_features)
+            with autocast('cuda'):
+                outputs = model(seqs, yolo_features)
             loss = criterion(outputs, labels)
             val_loss += loss.item()
             progress.set_postfix(loss=loss.item())
     return val_loss / len(val_loader)
 
 def train():
+    os.environ["NO_ALBUMENTATIONS_UPDATE"] = "1"
+    
     with open('configs/config.yaml', 'r') as f:
         config = yaml.safe_load(f)
     
@@ -53,7 +57,6 @@ def train():
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    # --- Dataset split into train/val ---
     print("Loading training dataset...")
     full_dataset = CustomDataset(config['data']['train_path'], config['data']['train_yolo_path'], train=True)
     print(f"Dataset size: {len(full_dataset)} samples")
@@ -63,21 +66,22 @@ def train():
     train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size])
     print(f"Train size: {train_size}, Validation size: {val_size}")
 
-    # --- Oversampling with WeightedRandomSampler ---
     print("Computing class weights for oversampling...")
     label_counts_path = os.path.join(config['data']['train_path'], 'label_counts.yaml')
     with open(label_counts_path, 'r') as f:
         counts = yaml.safe_load(f)
     print("Class counts from label_counts.yaml:", counts)
     
-    train_labels = []
-    for i in tqdm(range(len(train_dataset)), desc="Collecting train labels", leave=True, file=sys.stdout):
-        train_labels.append(train_dataset[i][1].item())
+    train_labels = train_dataset.dataset.labels
+    train_indices = train_dataset.indices
+    train_labels = [train_labels[i] for i in train_indices]
     
     label_dist = Counter(train_labels)
     print("Training label distribution:", {i: label_dist.get(i, 0) for i in range(config['model']['num_classes'])})
     
-    class_weights = [1.0 / counts.get(label, 1) for label in train_labels]
+    class_sample_counts = np.array([label_dist.get(i, 1) for i in range(config['model']['num_classes'])])
+    weights_per_class = 1.0 / (class_sample_counts ** 0.7)  # Adjusted for stronger minority class sampling
+    class_weights = [weights_per_class[label] for label in train_labels]
     print(f"Class weights (first 5 samples): {class_weights[:5]}")
     
     sampler = WeightedRandomSampler(weights=class_weights, num_samples=len(train_labels), replacement=True)
@@ -88,29 +92,26 @@ def train():
     val_loader = DataLoader(val_dataset, batch_size=config['training']['batch_size'],
                             shuffle=False, num_workers=4, pin_memory=True)
     
-    # --- Model, optimizer, scheduler ---
     print("Initializing model...")
     model = AnomalyModel(config['model']['num_classes']).to(device)
     print(f"GPU Memory after model init: {torch.cuda.memory_allocated(device)/1e9:.2f} GB allocated, "
           f"{torch.cuda.memory_reserved(device)/1e9:.2f} GB reserved")
     
-    # --- Per-class alpha for Focal Loss ---
     num_classes = config['model']['num_classes']
-    alpha = [1.0 / counts.get(i, 1) for i in range(num_classes)]
-    alpha = torch.tensor(alpha).to(device)
+    alpha = torch.tensor([1.0 / max(counts.get(i, 1), 1) for i in range(num_classes)], device=device)
+    alpha = torch.clamp(alpha, min=1e-3)
     alpha = alpha / alpha.sum() * num_classes
     print(f"Focal Loss alpha: {alpha.cpu().numpy().tolist()}")
     
-    optimizer = optim.AdamW(model.parameters(), lr=config['model']['lr'], weight_decay=0.01)
+    optimizer = optim.AdamW(model.parameters(), lr=config['model']['lr'], weight_decay=0.05)  # Increased weight decay
     scheduler = optim.lr_scheduler.OneCycleLR(
         optimizer, max_lr=config['model']['lr'], 
         steps_per_epoch=len(train_loader), epochs=config['training']['epochs']
     )
-    criterion = FocalLoss(alpha=alpha, gamma=2)
+    criterion = FocalLoss(alpha=alpha, gamma=3)  # Updated gamma
     
     scaler = GradScaler('cuda')
     
-    # --- Resume from checkpoint ---
     checkpoint_dir = 'models_saved'
     os.makedirs(checkpoint_dir, exist_ok=True)
     checkpoint_path = os.path.join(checkpoint_dir, 'checkpoint_latest.pth')
@@ -118,7 +119,7 @@ def train():
     best_macro_f1 = 0.0
     if os.path.exists(checkpoint_path):
         checkpoint = torch.load(checkpoint_path, map_location=device)
-        model.load_state_dict(checkpoint['model_state_dict'])
+        model.load_state_dict(checkpoint['model_state_dict'], strict=False)
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         scaler.load_state_dict(checkpoint['scaler_state_dict'])
         scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
@@ -126,7 +127,6 @@ def train():
         best_macro_f1 = checkpoint['best_macro_f1']
         print(f"Resumed from checkpoint at epoch {start_epoch} with best macro F1={best_macro_f1:.4f}")
     
-    # --- Early stopping variables ---
     patience = config['training'].get('patience', 5)
     counter = 0
     
@@ -153,22 +153,20 @@ def train():
         avg_loss = epoch_loss / len(train_loader)
         train_acc = multi_class_accuracy(model, train_loader, device)
         
-        # --- Validation ---
         val_loss = compute_val_loss(model, val_loader, criterion, device)
         val_acc = multi_class_accuracy(model, val_loader, device)
         
-        # --- Compute val macro F1 ---
         val_preds, val_labels = [], []
         with torch.no_grad():
             for seqs, labels, yolo_features in val_loader:
                 seqs, labels, yolo_features = seqs.to(device), labels.to(device), yolo_features.to(device)
-                outputs = model(seqs, yolo_features)
+                with autocast('cuda'):
+                    outputs = model(seqs, yolo_features)
                 preds = torch.argmax(outputs, dim=1).cpu().numpy()
                 val_preds.extend(preds)
                 val_labels.extend(labels.cpu().numpy())
         val_macro_f1 = precision_recall_fscore_support(val_labels, val_preds, average='macro')[2]
         
-        # --- Logging ---
         wandb.log({
             'epoch': epoch,
             'train_loss': avg_loss,
@@ -178,10 +176,11 @@ def train():
             'val_macro_f1': val_macro_f1,
             'lr': scheduler.get_last_lr()[0],
             'scaler': scaler.get_scale(),
-            'yolo_time': yolo_time
+            'yolo_time': yolo_time,
+            'gpu_alloc_gb': torch.cuda.memory_allocated(device)/1e9,
+            'gpu_reserved_gb': torch.cuda.memory_reserved(device)/1e9
         })
         
-        # --- Epoch summary ---
         print(f"\nEpoch {epoch+1} Summary:")
         print(f"  Train Loss: {avg_loss:.4f}, Train Accuracy: {train_acc:.4f}")
         print(f"  Validation Loss: {val_loss:.4f}, Validation Accuracy: {val_acc:.4f}")
@@ -192,7 +191,6 @@ def train():
         print(f"  Scaler: {scaler.get_scale():.2f}")
         print(f"  YOLO Time: {yolo_time:.2f}s")
         
-        # --- Save checkpoint ---
         if epoch % 5 == 0 or epoch == config['training']['epochs'] - 1:
             torch.save({
                 'epoch': epoch,
@@ -204,7 +202,6 @@ def train():
             }, checkpoint_path)
             print(f"Checkpoint saved at epoch {epoch+1} to {checkpoint_path}")
         
-        # --- Early stopping check ---
         if val_macro_f1 > best_macro_f1:
             best_macro_f1 = val_macro_f1
             torch.save(model.state_dict(), os.path.join(checkpoint_dir, 'best_model.pth'))
@@ -218,11 +215,10 @@ def train():
         
         scheduler.step()
     
-    # --- Evaluation on best model ---
     print("Loading test dataset...")
     test_dataset = CustomDataset(config['data']['test_path'], config['data']['test_yolo_path'], train=False)
     print(f"Test dataset size: {len(test_dataset)} samples")
-    test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, num_workers=4, pin_memory=True)
+    test_loader = DataLoader(test_dataset, batch_size=config['training']['batch_size'], shuffle=False, num_workers=4, pin_memory=True)
     classes = [
         'Abuse', 'Arrest', 'Arson', 'Assault', 'Burglary', 'Explosion',
         'Fighting', 'Normal Videos', 'RoadAccidents', 'Robbery',
@@ -233,7 +229,6 @@ def train():
     acc, macro_f1, weighted_f1 = evaluate_model(model, test_loader, device, classes)
     print(f"Test Evaluation Complete: Accuracy={acc:.4f}, Macro F1={macro_f1:.4f}, Weighted F1={weighted_f1:.4f}")
     
-    # --- Save evaluation to TXT and images ---
     eval_dir = os.path.join(checkpoint_dir, 'evaluation')
     os.makedirs(eval_dir, exist_ok=True)
     txt_path = os.path.join(eval_dir, 'test_metrics.txt')
@@ -246,7 +241,8 @@ def train():
         with torch.no_grad():
             for seqs, labels, yolo_features in test_loader:
                 seqs, labels, yolo_features = seqs.to(device), labels.to(device), yolo_features.to(device)
-                outputs = model(seqs, yolo_features)
+                with autocast('cuda'):
+                    outputs = model(seqs, yolo_features)
                 preds = torch.argmax(outputs, dim=1).cpu().numpy()
                 all_preds.extend(preds)
                 all_labels.extend(labels.cpu().numpy())
@@ -258,6 +254,10 @@ def train():
         f.write("\nConfusion Matrix:\n")
         cm = confusion_matrix(all_labels, all_preds)
         f.write(str(cm) + "\n")
+    
+    cm_df = pd.DataFrame(cm, index=classes, columns=classes)
+    wandb.log({"confusion_matrix": wandb.Table(dataframe=cm_df)})
+    
     print(f"Test metrics saved to {txt_path}")
     
     from sklearn.metrics import ConfusionMatrixDisplay
@@ -278,7 +278,8 @@ def multi_class_accuracy(model, loader, device):
         progress = tqdm(loader, desc="Computing Accuracy", leave=True, file=sys.stdout)
         for batch_idx, (seqs, labels, yolo_features) in enumerate(progress):
             seqs, labels, yolo_features = seqs.to(device), labels.to(device), yolo_features.to(device)
-            outputs = model(seqs, yolo_features)
+            with autocast('cuda'):
+                outputs = model(seqs, yolo_features)
             preds = torch.argmax(outputs, dim=1)
             correct += (preds == labels).sum().item()
             total += labels.size(0)
@@ -286,6 +287,5 @@ def multi_class_accuracy(model, loader, device):
     return correct / total
 
 if __name__ == "__main__":
-    import os
     os.environ["PYTHONUNBUFFERED"] = "1"
     train()

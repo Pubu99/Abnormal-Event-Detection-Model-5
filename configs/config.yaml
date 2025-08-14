@@ -1,13 +1,13 @@
 data:
   train_path: data/processed/train
   test_path: data/processed/test
-  train_yolo_path: data/processed/train_yolo # Added
-  test_yolo_path: data/processed/test_yolo # Added
+  train_yolo_path: data/processed/train_yolo
+  test_yolo_path: data/processed/test_yolo
 model:
   num_classes: 14
   lr: 0.0005
 training:
-  epochs: 100
-  batch_size: 32
+  epochs: 30 # Reduced from 100 to prevent unnecessary training
+  batch_size: 16 # Reduced to 16 to speed up training (test if memory allows)
   val_ratio: 0.1
   patience: 5
