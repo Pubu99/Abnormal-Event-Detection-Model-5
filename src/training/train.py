@@ -19,19 +19,47 @@ from src.models.base_model import AnomalyModel
 from src.utils.metrics import multi_class_accuracy, evaluate_model
 
 class FocalLoss(nn.Module):
-    def __init__(self, alpha, gamma=3, reduction='mean'):  # Increased gamma to 3
+    def __init__(self, alpha, gamma=3, reduction='mean', label_smoothing=0.1):
         super().__init__()
         self.alpha = alpha
         self.gamma = gamma
         self.reduction = reduction
-    
+        self.label_smoothing = label_smoothing
+
     def forward(self, inputs, targets):
-        ce_loss = nn.CrossEntropyLoss(reduction='none')(inputs, targets)
+        # Label smoothing
+        num_classes = inputs.size(1)
+        with torch.no_grad():
+            true_dist = torch.zeros_like(inputs)
+            true_dist.fill_(self.label_smoothing / (num_classes - 1))
+            true_dist.scatter_(1, targets.unsqueeze(1), 1.0 - self.label_smoothing)
+        log_probs = torch.nn.functional.log_softmax(inputs, dim=1)
+        ce_loss = -(true_dist * log_probs).sum(dim=1)
         pt = torch.exp(-ce_loss)
         focal_loss = self.alpha[targets] * (1 - pt) ** self.gamma * ce_loss
         if self.reduction == 'mean':
             return focal_loss.mean()
         return focal_loss
+
+# Temporal smoothing for predictions (majority voting over window)
+def temporal_smoothing(predictions, window=5):
+    """
+    Smooths predictions over time using majority voting in a sliding window.
+    Args:
+        predictions: list or np.array of class predictions (int)
+        window: int, size of the smoothing window
+    Returns:
+        smoothed: np.array of smoothed predictions
+    """
+    import numpy as np
+    from scipy.stats import mode
+    predictions = np.array(predictions)
+    smoothed = np.copy(predictions)
+    for i in range(len(predictions)):
+        start = max(0, i - window // 2)
+        end = min(len(predictions), i + window // 2 + 1)
+        smoothed[i] = mode(predictions[start:end], keepdims=False).mode
+    return smoothed
 
 def compute_val_loss(model, val_loader, criterion, device):
     model.eval()
@@ -72,25 +100,18 @@ def train():
         counts = yaml.safe_load(f)
     print("Class counts from label_counts.yaml:", counts)
     
-    train_labels = train_dataset.dataset.labels
-    train_indices = train_dataset.indices
-    train_labels = [train_labels[i] for i in train_indices]
-    
+    # For hierarchical: get binary and multiclass labels
+    train_labels = [1 if l != 7 else 0 for l in [full_dataset.labels[i] for i in train_dataset.indices]]
     label_dist = Counter(train_labels)
-    print("Training label distribution:", {i: label_dist.get(i, 0) for i in range(config['model']['num_classes'])})
-    
-    class_sample_counts = np.array([label_dist.get(i, 1) for i in range(config['model']['num_classes'])])
-    weights_per_class = 1.0 / (class_sample_counts ** 0.7)  # Adjusted for stronger minority class sampling
+    print("Training binary label distribution:", dict(label_dist))
+    class_sample_counts = np.array([label_dist.get(i, 1) for i in range(2)])
+    weights_per_class = 1.0 / (class_sample_counts ** 0.7)
     class_weights = [weights_per_class[label] for label in train_labels]
     print(f"Class weights (first 5 samples): {class_weights[:5]}")
-    
     sampler = WeightedRandomSampler(weights=class_weights, num_samples=len(train_labels), replacement=True)
     print("WeightedRandomSampler initialized.")
-    
-    train_loader = DataLoader(train_dataset, batch_size=config['training']['batch_size'],
-                              sampler=sampler, num_workers=4, pin_memory=True)
-    val_loader = DataLoader(val_dataset, batch_size=config['training']['batch_size'],
-                            shuffle=False, num_workers=4, pin_memory=True)
+    train_loader = DataLoader(train_dataset, batch_size=config['training']['batch_size'], sampler=sampler, num_workers=4, pin_memory=True)
+    val_loader = DataLoader(val_dataset, batch_size=config['training']['batch_size'], shuffle=False, num_workers=4, pin_memory=True)
     
     print("Initializing model...")
     model = AnomalyModel(config['model']['num_classes']).to(device)
@@ -108,7 +129,8 @@ def train():
         optimizer, max_lr=config['model']['lr'], 
         steps_per_epoch=len(train_loader), epochs=config['training']['epochs']
     )
-    criterion = FocalLoss(alpha=alpha, gamma=3)  # Updated gamma
+    criterion_bin = FocalLoss(alpha=torch.tensor([alpha[0], alpha[7]], device=device), gamma=3)
+    criterion_multi = FocalLoss(alpha=alpha, gamma=3)
     
     scaler = GradScaler('cuda')
     
@@ -134,37 +156,48 @@ def train():
         model.train()
         epoch_loss = 0
         yolo_time = 0
-        progress = tqdm(train_loader, desc=f"Epoch {epoch+1}/{config['training']['epochs']}", 
-                        leave=True, file=sys.stdout)
-        for batch_idx, (seqs, labels, yolo_features) in enumerate(progress):
-            seqs, labels, yolo_features = seqs.to(device), labels.to(device), yolo_features.to(device)
+        progress = tqdm(train_loader, desc=f"Epoch {epoch+1}/{config['training']['epochs']}", leave=True, file=sys.stdout)
+        for batch_idx, (seqs, binary_labels, multiclass_labels, yolo_features) in enumerate(progress):
+            seqs, binary_labels, multiclass_labels, yolo_features = seqs.to(device), binary_labels.to(device), multiclass_labels.to(device), yolo_features.to(device)
             optimizer.zero_grad()
             start_time = time.time()
+            # MixUp/CutMix augmentation
+            if full_dataset.use_mixup and np.random.rand() < 0.5:
+                idx2 = torch.randperm(seqs.size(0))
+                seqs, binary_labels = full_dataset.mixup(seqs, binary_labels, seqs[idx2], binary_labels[idx2])
+            elif full_dataset.use_cutmix and np.random.rand() < 0.5:
+                idx2 = torch.randperm(seqs.size(0))
+                seqs, binary_labels = full_dataset.cutmix(seqs, binary_labels, seqs[idx2], binary_labels[idx2])
             with autocast('cuda'):
                 outputs = model(seqs, yolo_features)
-                loss = criterion(outputs, labels)
+                # Stage 1: Binary classification (Normal vs Abnormal)
+                loss_bin = criterion_bin(outputs, binary_labels)
+                # Stage 2: Multi-class classification (only for abnormal)
+                abnormal_mask = (binary_labels == 1)
+                if abnormal_mask.sum() > 0:
+                    loss_multi = criterion_multi(outputs[abnormal_mask], multiclass_labels[abnormal_mask])
+                    loss = loss_bin + loss_multi
+                else:
+                    loss = loss_bin
             yolo_time += time.time() - start_time
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
             epoch_loss += loss.item()
             progress.set_postfix(loss=loss.item(), scaler=scaler.get_scale())
-        
         avg_loss = epoch_loss / len(train_loader)
         train_acc = multi_class_accuracy(model, train_loader, device)
-        
-        val_loss = compute_val_loss(model, val_loader, criterion, device)
+        val_loss = compute_val_loss(model, val_loader, criterion_bin, device)
         val_acc = multi_class_accuracy(model, val_loader, device)
-        
         val_preds, val_labels = [], []
         with torch.no_grad():
-            for seqs, labels, yolo_features in val_loader:
-                seqs, labels, yolo_features = seqs.to(device), labels.to(device), yolo_features.to(device)
+            for seqs, binary_labels, multiclass_labels, yolo_features in val_loader:
+                seqs, binary_labels, multiclass_labels, yolo_features = seqs.to(device), binary_labels.to(device), multiclass_labels.to(device), yolo_features.to(device)
                 with autocast('cuda'):
                     outputs = model(seqs, yolo_features)
                 preds = torch.argmax(outputs, dim=1).cpu().numpy()
                 val_preds.extend(preds)
-                val_labels.extend(labels.cpu().numpy())
+                val_labels.extend(multiclass_labels.cpu().numpy())
         val_macro_f1 = precision_recall_fscore_support(val_labels, val_preds, average='macro')[2]
         
         wandb.log({

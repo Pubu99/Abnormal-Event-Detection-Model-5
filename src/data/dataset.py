@@ -90,18 +90,22 @@ class CustomDataset(Dataset):
         return self.cumulative_lengths[-1] if self.cumulative_lengths else 0
     
     def __getitem__(self, idx):
+        """
+        Returns:
+            seq_tensor: [seq_len, 3, H, W] (torch.Tensor)
+            binary_label: 0 for Normal, 1 for Abnormal (torch.LongTensor)
+            multiclass_label: 0-13 (torch.LongTensor)
+            yolo_features: [seq_len, 80] (torch.Tensor)
+        """
         file_idx = 0
         while idx >= self.cumulative_lengths[file_idx]:
             file_idx += 1
-        
         offset = idx - (self.cumulative_lengths[file_idx - 1] if file_idx > 0 else 0)
-        
         with h5py.File(self.files[file_idx], 'r') as hf:
-            seq = hf['sequences'][offset]  # Shape: [seq_len, height, width, channels]
-        
-        seq = np.transpose(seq, (0, 3, 1, 2))  # [seq_len, 3, height, width]
-        
+            seq = hf['sequences'][offset]
+        seq = np.transpose(seq, (0, 3, 1, 2))
         seq_len = 16
+        # Temporal augmentations
         if self.train and np.random.rand() < 0.5:
             drop_num = np.random.randint(0, seq_len // 4)
             keep_indices = np.random.choice(seq_len, seq_len - drop_num, replace=False)
@@ -118,18 +122,19 @@ class CustomDataset(Dataset):
                     seq = np.pad(seq, ((0, seq_len - len(seq)), (0, 0), (0, 0), (0, 0)), mode='edge')
                 elif len(seq) > seq_len:
                     seq = seq[:seq_len]
-        
+        # Frame augmentations
         augmented_seq = []
         transform = self.strong_transform if self.train and np.random.rand() < 0.6 else self.light_transform
         for frame in seq:
             augmented = transform(image=frame.transpose(1, 2, 0)) if self.train else self.transform(image=frame.transpose(1, 2, 0))
             augmented_seq.append(augmented['image'].float() / 255.0)
-        
-        seq_tensor = torch.stack(augmented_seq)  # Shape: [seq_len, 3, height, width]
-        
+        seq_tensor = torch.stack(augmented_seq)
+        # YOLO features
         yolo_features = torch.zeros(seq_len, 80, dtype=torch.float32) if self.yolo_files is None else None
         if self.yolo_files:
             with h5py.File(self.yolo_files[file_idx], 'r') as hf_yolo:
                 yolo_features = torch.tensor(hf_yolo['yolo_features'][offset], dtype=torch.float32)
-        
-        return seq_tensor, torch.tensor(self.labels[idx], dtype=torch.long), yolo_features
+        # Hierarchical labels
+        multiclass_label = torch.tensor(self.labels[idx], dtype=torch.long)
+        binary_label = torch.tensor(0 if multiclass_label == 7 else 1, dtype=torch.long)  # 0: Normal, 1: Abnormal
+        return seq_tensor, binary_label, multiclass_label, yolo_features
