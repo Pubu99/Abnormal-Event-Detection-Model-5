@@ -7,10 +7,16 @@ import albumentations as A
 from albumentations.pytorch import ToTensorV2
 
 class CustomDataset(Dataset):
-    def __init__(self, processed_dir: str, yolo_dir: str = None, train: bool = True):
+    """
+    Custom dataset for abnormal event detection with support for YOLO features and advanced augmentations.
+    Includes MixUp and CutMix for improved generalization.
+    """
+    def __init__(self, processed_dir: str, yolo_dir: str = None, train: bool = True, use_mixup: bool = False, use_cutmix: bool = False):
         self.files = [os.path.join(processed_dir, f) for f in os.listdir(processed_dir) if f.endswith('.h5')]
         self.yolo_files = [os.path.join(yolo_dir, f) for f in os.listdir(yolo_dir) if f.endswith('.h5')] if yolo_dir else None
         self.train = train
+        self.use_mixup = use_mixup
+        self.use_cutmix = use_cutmix
         if train:
             self.strong_transform = A.Compose([
                 A.Resize(224, 224, always_apply=True),
@@ -24,7 +30,7 @@ class CustomDataset(Dataset):
                 A.GaussNoise(var_limit=(20, 60), p=0.4),
                 A.MotionBlur(blur_limit=7, p=0.3),
                 A.OpticalDistortion(p=0.3),
-                A.RandomResizedCrop(224, 224, scale=(0.8, 1.0), p=0.5),  # Added for regularization
+                A.RandomResizedCrop(224, 224, scale=(0.8, 1.0), p=0.5),
                 ToTensorV2()
             ])
             self.light_transform = A.Compose([
@@ -38,7 +44,7 @@ class CustomDataset(Dataset):
                 A.Resize(224, 224, always_apply=True),
                 ToTensorV2()
             ])
-        
+
         self.labels = []
         self.lengths = []
         for f in self.files:
@@ -50,6 +56,35 @@ class CustomDataset(Dataset):
         for l in self.lengths:
             cum_sum += l
             self.cumulative_lengths.append(cum_sum)
+
+    def mixup(self, x1, y1, x2, y2, alpha=0.4):
+        lam = np.random.beta(alpha, alpha)
+        x = lam * x1 + (1 - lam) * x2
+        y = lam * y1 + (1 - lam) * y2
+        return x, y
+
+    def cutmix(self, x1, y1, x2, y2, alpha=1.0):
+        lam = np.random.beta(alpha, alpha)
+        bbx1, bby1, bbx2, bby2 = self.rand_bbox(x1.shape, lam)
+        x = x1.clone()
+        x[..., bby1:bby2, bbx1:bbx2] = x2[..., bby1:bby2, bbx1:bbx2]
+        lam = 1 - ((bbx2 - bbx1) * (bby2 - bby1) / (x1.shape[-1] * x1.shape[-2]))
+        y = lam * y1 + (1 - lam) * y2
+        return x, y
+
+    def rand_bbox(self, size, lam):
+        W = size[-1]
+        H = size[-2]
+        cut_rat = np.sqrt(1. - lam)
+        cut_w = int(W * cut_rat)
+        cut_h = int(H * cut_rat)
+        cx = np.random.randint(W)
+        cy = np.random.randint(H)
+        bbx1 = np.clip(cx - cut_w // 2, 0, W)
+        bby1 = np.clip(cy - cut_h // 2, 0, H)
+        bbx2 = np.clip(cx + cut_w // 2, 0, W)
+        bby2 = np.clip(cy + cut_h // 2, 0, H)
+        return bbx1, bby1, bbx2, bby2
     
     def __len__(self):
         return self.cumulative_lengths[-1] if self.cumulative_lengths else 0

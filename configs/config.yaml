@@ -7,7 +7,7 @@ model:
   num_classes: 14
   lr: 0.0005
 training:
-  epochs: 30 # Reduced from 100 to prevent unnecessary training
-  batch_size: 16 # Reduced to 16 to speed up training (test if memory allows)
+  epochs: 30 
+  batch_size: 16 
   val_ratio: 0.1
   patience: 5
